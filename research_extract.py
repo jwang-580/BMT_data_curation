@@ -2,8 +2,12 @@
 """
 Research data fields Script - Extract research data fields from medical notes using local LLMs via Ollama
 
-This script extracts research data fields from daily progress notes (D0 to D+5) and discharge summary using different local LLMs with structured output.
-The research data fields include patient demographics, disease information, and transplant details.
+This script uses a simple two-step approach:
+STEP 1: Extract daily clinical findings from progress notes, plus neurotoxicity from discharge summary
+STEP 2: Combine all daily findings + DC neurotoxicity into final research fields
+
+Discharge summary is processed separately to extract only neurotoxicity for the whole hospitalization.
+All medical logic and rules are handled by the LLM via prompts - no hard-coded restrictions.
 
 """
 
@@ -23,14 +27,38 @@ RESEARCH_FIELDS = ['crs_y_n', 'fever_onset_date', 'last_fever_date', 'max_temp',
                    'neurotox_y_n', 'toci_y_n', 'toci_start_date', 'toci_stop_date', 'total_dose_toci']
 
 
+class DailyFindings(BaseModel):
+    """Pydantic model for daily clinical findings extraction"""
+    
+    day_date: Optional[str] = Field(None, description="Date of this daily note (YYYY-MM-DD format)")
+    max_temp_today: Optional[float] = Field(None, description="Maximum temperature today in Fahrenheit", ge=95.0, le=110.0)
+    fever_today: Optional[Literal["Y", "N"]] = Field(None, description="Whether fever (Tmax > 100.3F) occurred today")
+    crs_signs_today: Optional[Literal["Y", "N"]] = Field(None, description="Whether cytokine release syndrome (CRS) occurred today (if fever occurred today, then CRS occurred today)")
+    hypotension_today: Optional[Literal["Y", "N"]] = Field(None, description="Hypotension requiring fluids/pressors today")
+    pressor_count_today: Optional[int] = Field(None, description="Number of vasopressors used today", ge=0, le=10)
+    hypoxia_today: Optional[Literal["Y", "N"]] = Field(None, description="Hypoxia requiring oxygen today")
+    high_flow_o2_today: Optional[Literal["Y", "N"]] = Field(None, description="High flow oxygen used today")
+    bipap_intubation_today: Optional[Literal["Y", "N"]] = Field(None, description="BIPAP or intubation today")
+    neurotox_today: Optional[Literal["Y", "N"]] = Field(None, description="Neurotoxicity symptoms (altered mental status, confusion, seizures, etc.) today")
+    tocilizumab_today: Optional[Literal["Y", "N"]] = Field(None, description="Whether tocilizumab was used today to mitigate CRS")
+    toci_doses_today: Optional[float] = Field(None, description="Number of tocilizumab doses given today", ge=0, le=3)
+    tocilizumab_note: Optional[str] = Field(None, description="Note about tocilizumab use recently")
+
+
+class DischargeSummaryFindings(BaseModel):
+    """Pydantic model for discharge summary neurotoxicity extraction"""
+    
+    neurotox_hospitalization: Optional[Literal["Y", "N"]] = Field(None, description="Neurotoxicity (altered mental status, confusion, seizures, etc.) occurred during the whole hospitalization (Y/N)")
+
+
 class ResearchExtraction(BaseModel):
     """Pydantic model for structured research information extraction"""
     
     MRN: Optional[str] = Field(None, description="Medical Record Number - unique patient identifier")
     crs_y_n: Optional[Literal["Y", "N"]] = Field(None, description="Cytokine Release Syndrome occured (Y/N)")
-    fever_onset_date: Optional[str] = Field(None, description="Date of fever onset (YYYY-MM-DD format)")
-    last_fever_date: Optional[str] = Field(None, description="Date of last fever (YYYY-MM-DD format)")
-    max_temp: Optional[float] = Field(None, description="Maximum temperature in Celsius", ge=35.0, le=45.0)
+    fever_onset_date: Optional[str] = Field(None, description="Date of fever onset (YYYY-MM-DD format) or None")
+    last_fever_date: Optional[str] = Field(None, description="Date of last fever (YYYY-MM-DD format) or None")
+    max_temp: Optional[float] = Field(None, description="Maximum temperature in Fahrenheit", ge=95.0, le=110.0)
     hypotension_y_n: Optional[Literal["Y", "N"]] = Field(None, description="Hypotension occured (Y/N)")
     pressor_use_num: Optional[int] = Field(None, description="Number of vasopressors used", ge=0, le=10)
     hypoxia_y_n: Optional[Literal["Y", "N"]] = Field(None, description="Hypoxia requiring supplemental oxygen (Y/N)")
@@ -38,9 +66,9 @@ class ResearchExtraction(BaseModel):
     bipap_or_intubation_y_n: Optional[Literal["Y", "N"]] = Field(None, description="BIPAP or intubation required (Y/N)")
     neurotox_y_n: Optional[Literal["Y", "N"]] = Field(None, description="Neurotoxicity occured (Y/N)")
     toci_y_n: Optional[Literal["Y", "N"]] = Field(None, description="Tocilizumab administered (Y/N)")
-    toci_start_date: Optional[str] = Field(None, description="Tocilizumab start date (YYYY-MM-DD format)")
-    toci_stop_date: Optional[str] = Field(None, description="Tocilizumab stop date (YYYY-MM-DD format)")
-    total_dose_toci: Optional[float] = Field(None, description="Total doses of tocilizumab administered", ge=0)
+    toci_start_date: Optional[str] = Field(None, description="Tocilizumab start date (YYYY-MM-DD format) or None")
+    toci_stop_date: Optional[str] = Field(None, description="Tocilizumab stop date (YYYY-MM-DD format) or None")
+    total_dose_toci: Optional[float] = Field(None, description="Total doses of tocilizumab administered", ge=0, le=3)
 
 class OllamaExtractor:
     """Extract medical information using Ollama local LLMs with structured output"""
@@ -60,62 +88,32 @@ class OllamaExtractor:
             print(f"Failed to connect to Ollama: {e}")
             return False
     
-    def list_available_models(self) -> List[str]:
-        """List available models in Ollama"""
-        try:
-            import ollama
-            models_response = ollama.list()
-            
-            # Debug: Print the actual structure
-            print(f"Debug - Ollama list response: {models_response}")
-            
-            # Handle different possible response structures
-            if isinstance(models_response, dict):
-                if 'models' in models_response:
-                    models_list = models_response['models']
-                else:
-                    models_list = models_response
-            else:
-                models_list = models_response
-            
-            # Extract model names with multiple fallbacks
-            model_names = []
-            for model in models_list:
-                if isinstance(model, dict):
-                    # Try different possible keys
-                    name = (model.get('name') or 
-                           model.get('model') or 
-                           model.get('id') or 
-                           str(model))
-                    model_names.append(name)
-                else:
-                    # If it's not a dict, use string representation
-                    model_names.append(str(model))
-            
-            print(f"Extracted model names: {model_names}")
-            return model_names
-            
-        except Exception as e:
-            print(f"Failed to list models: {e}")
-            # Try alternative approach with direct ollama command
-            try:
-                import subprocess
-                result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    lines = result.stdout.strip().split('\n')[1:]  # Skip header
-                    models = [line.split()[0] for line in lines if line.strip()]
-                    print(f"Models from CLI: {models}")
-                    return models
-            except Exception as cli_e:
-                print(f"CLI fallback also failed: {cli_e}")
-            
-            return []
-    
-    def extract_with_model(self, model_name: str, note_text: str, mrn: str, missing_fields: List[str] = None, day_info: str = "", accumulated_data: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Extract research fields using a specific model with structured output"""
+    def extract_daily_findings(self, model_name: str, note_text: str, day_date: str, day_info: str) -> Dict[str, Any]:
+        """STEP 1: Extract simple daily findings from a single day's notes"""
         
-        # Create extraction prompt (targeted if missing_fields provided)
-        prompt = self._create_extraction_prompt(note_text, missing_fields, day_info, accumulated_data)
+        prompt = f"""
+MEDICAL RECORDS FOR {day_info}:
+{note_text}
+
+WHAT YOU ARE DOING:
+You are extracting clinical findings from today's medical notes only. 
+
+YOUR TASK:
+Extract only TODAY's clinical findings. Look for:
+- Maximum temperature today (look for "PHYSICAL EXAM  Temp:")
+- Whether there is fever today (temperature > 100.3F), Y/N
+- Whether there is CRS today (if fever occurred today, then CRS occurred today), Y/N
+- Hypotension requiring treatment today
+- Number of vasopressors used today
+- Hypoxia requiring oxygen today
+- High flow oxygen or respiratory support today
+- BIPAP or intubation today
+- Neurotoxicity symptoms today (confusion, altered mental status, seizures)
+- If tocilizumab is used today to mitigate CRS, Y/N
+- Number of tocilizumab doses given today
+- Note about tocilizumab use recently
+
+"""
         
         try:
             # Make structured request to Ollama
@@ -124,7 +122,178 @@ class OllamaExtractor:
                 messages=[
                     {
                         'role': 'system',
-                        'content': 'You are a medical information extraction expert. Extract the requested baseline information from medical notes accurately and completely.'
+                        'content': 'You are a medical information extraction expert. Extract only the clinical findings from today\'s medical note accurately.'
+                    },
+                    {
+                        'role': 'user', 
+                        'content': prompt
+                    }
+                ],
+                format=DailyFindings.model_json_schema(),
+                options={
+                    'temperature': 0.1,
+                    'top_p': 0.9,
+                }
+            )
+            
+            # Parse structured response
+            daily_findings = DailyFindings.model_validate_json(response.message.content)
+            result_dict = daily_findings.model_dump()
+            result_dict['day_date'] = day_date
+            result_dict['extraction_success'] = True
+            
+            return result_dict
+                
+        except Exception as e:
+            print(f"Daily extraction failed for {day_info}: {e}")
+            return {
+                'day_date': day_date,
+                'extraction_success': False,
+                'error': str(e)
+            }
+    
+    def extract_dc_summary_neurotox(self, model_name: str, dc_note_text: str) -> Dict[str, Any]:
+        """Extract neurotoxicity information from discharge summary for the whole hospitalization"""
+        
+        prompt = f"""
+DISCHARGE SUMMARY:
+{dc_note_text}
+
+WHAT YOU ARE DOING:
+You are reviewing a discharge summary to determine if neurotoxicity occurred during the ENTIRE hospitalization.
+
+YOUR TASK:
+Review the entire discharge summary and determine if the patient experienced neurotoxicity at ANY point during this hospitalization. Look for mentions of:
+- Altered mental status
+- Confusion or delirium
+- Seizures
+- Neurological symptoms
+- Cognitive changes
+- Encephalopathy
+- Any mention of neurotoxicity
+
+"""
+        
+        try:
+            # Make structured request to Ollama
+            response = chat(
+                model=model_name,
+                messages=[
+                    {
+                        'role': 'system',
+                        'content': 'You are a medical expert reviewing discharge summaries for neurotoxicity during hospitalization.'
+                    },
+                    {
+                        'role': 'user', 
+                        'content': prompt
+                    }
+                ],
+                format=DischargeSummaryFindings.model_json_schema(),
+                options={
+                    'temperature': 0.1,
+                    'top_p': 0.9,
+                }
+            )
+            
+            # Parse structured response
+            dc_findings = DischargeSummaryFindings.model_validate_json(response.message.content)
+            result_dict = dc_findings.model_dump()
+            result_dict['extraction_success'] = True
+            
+            return result_dict
+                
+        except Exception as e:
+            print(f"DC summary neurotox extraction failed: {e}")
+            return {
+                'neurotox_hospitalization': None,
+                'extraction_success': False,
+                'error': str(e)
+            }
+    
+    def combine_daily_findings(self, model_name: str, daily_findings_list: List[Dict], mrn: str, dc_neurotox_findings: Dict[str, Any] = None) -> Dict[str, Any]:
+        """STEP 2: Simply combine all daily findings into final research fields"""
+        
+        # Format daily findings for the prompt
+        daily_summary = ""
+        for i, findings in enumerate(daily_findings_list):
+            if findings.get('extraction_success', False):
+                daily_summary += f"\nDay {i+1} ({findings.get('day_date', 'Unknown')}):\n"
+                for key, value in findings.items():
+                    if key not in ['day_date', 'extraction_success', 'error'] and value is not None:
+                        daily_summary += f"  {key}: {value}\n"
+        
+        # Add DC neurotoxicity findings if available
+        dc_neurotox_section = ""
+        if dc_neurotox_findings and dc_neurotox_findings.get('extraction_success', False):
+            dc_neurotox_section = f"\nDISCHARGE SUMMARY NEUROTOXICITY (whole hospitalization):\n"
+            neurotox_value = dc_neurotox_findings.get('neurotox_hospitalization')
+            if neurotox_value is not None:
+                dc_neurotox_section += f"  neurotoxicity_during_hospitalization: {neurotox_value}\n"
+        
+            prompt = f"""
+DAILY FINDINGS ACROSS HOSPITALIZATION:
+{daily_summary}
+{dc_neurotox_section}
+
+WHAT YOU ARE DOING:
+You are combining daily clinical findings into final research data fields for a stem cell transplant study investigating cytokine release syndrome (CRS) and use to tocilizumab.
+
+YOUR TASK:
+Review all the daily findings above and combine them into final research fields. You must provide values for ALL research fields listed.
+
+UNDERSTANDING THE DAILY FIELDS:
+Each day shows findings for THAT DAY ONLY:
+- max_temp_today: Highest temperature recorded on this specific day (Fahrenheit)
+- fever_today: Was there fever (>100.3F) on this specific day? (Y/N)
+- crs_signs_today: Were there is CRS on this specific day? (Y/N)
+- hypotension_today: Was there hypotension requiring treatment on this specific day? (Y/N)
+- pressor_count_today: Number of vasopressors used on this specific day (0, 1, 2, etc.)
+- hypoxia_today: Was there hypoxia requiring oxygen on this specific day? (Y/N)
+- high_flow_o2_today: Was high flow oxygen used on this specific day? (Y/N)
+- bipap_intubation_today: Was BIPAP or intubation used on this specific day? (Y/N)
+- neurotox_today: Were there neurotoxicity symptoms on this specific day? (Y/N)
+- tocilizumab_today: Was tocilizumab given on this specific day? (Y/N)
+- toci_doses_today: Number of tocilizumab doses given on this specific day (0, 1, 2, etc.)
+- tocilizumab_note: Note about recent tocilizumab use. Sometimes tocilizumab use is mentioned in the note of next day. 
+
+HOW TO COMBINE ACROSS DAYS:
+- Y/N fields: If ANY day shows "Y", then final result = "Y". Only if all days show "N", then "N"
+- Dates: Find earliest date for onset, latest date for end
+- Numbers: Take highest value for maximums, add up for totals
+
+REQUIRED RESEARCH FIELDS:
+- crs_y_n: Overall CRS occurrence (Y/N) - "Y" if any day shows crs_signs_today="Y" OR fever_today="Y"
+- fever_onset_date: Date of first fever (YYYY-MM-DD or null) - earliest day with fever_today="Y"
+- last_fever_date: Date of last fever (YYYY-MM-DD or null) - latest day with fever_today="Y"
+- max_temp: Highest temperature across all days - maximum of all max_temp_today values
+- hypotension_y_n: Any hypotension occurrence (Y/N) - "Y" if any day shows hypotension_today="Y"
+- pressor_use_num: Maximum number of pressors used - highest pressor_count_today value
+- hypoxia_y_n: Any hypoxia occurrence (Y/N) - "Y" if any day shows hypoxia_today="Y"
+- high_flow_o2_y_n: Any high flow oxygen use (Y/N) - "Y" if any day shows high_flow_o2_today="Y"
+- bipap_or_intubation_y_n: Any BIPAP/intubation use (Y/N) - "Y" if any day shows bipap_intubation_today="Y"
+- neurotox_y_n: Any neurotoxicity occurrence (Y/N) - USE DISCHARGE SUMMARY if available, otherwise "Y" if any day shows neurotox_today="Y"
+- toci_y_n: Any tocilizumab administration (Y/N) - "Y" if any day shows tocilizumab_today="Y"
+- toci_start_date: First tocilizumab date (YYYY-MM-DD or null) - earliest day with tocilizumab_today="Y"
+- toci_stop_date: Last tocilizumab date (YYYY-MM-DD or null) - latest day with tocilizumab_today="Y"
+- total_dose_toci: Total tocilizumab doses given - sum of all toci_doses_today values
+
+EXAMPLES OF CORRECT LOGIC:
+- If Day 1: crs_signs_today = "N", Day 2: crs_signs_today = "Y" → crs_y_n = "Y"
+- If Day 1: fever_today = "Y", Day 2: fever_today = "N" → fever_onset_date = Day 1 date, last_fever_date = Day 1 date
+- If Day 1: max_temp = 101.0, Day 2: max_temp = 103.5 → max_temp = 103.5
+- If Day 1: toci_doses_today = 1.0, Day 2: toci_doses_today = 2.0 → total_dose_toci = 3.0
+
+RETURN: Complete final research data with ALL required fields using the combination rules above.
+"""
+        
+        try:
+            # Make structured request to Ollama
+            response = chat(
+                model=model_name,
+                messages=[
+                    {
+                        'role': 'system',
+                        'content': 'You are a medical researcher combining daily findings into final research data. Apply proper medical logic to aggregate findings across days.'
                     },
                     {
                         'role': 'user', 
@@ -133,122 +302,34 @@ class OllamaExtractor:
                 ],
                 format=ResearchExtraction.model_json_schema(),
                 options={
-                    'temperature': 0.1,  # Low temperature for consistency
+                    'temperature': 0.1,
                     'top_p': 0.9,
                 }
             )
             
             # Parse structured response
-            extracted_data = ResearchExtraction.model_validate_json(response.message.content)
-            
-            # Convert to dict and ensure MRN is set
-            result_dict = extracted_data.model_dump()
-            result_dict['MRN'] = mrn  # Ensure MRN is always set correctly
+            final_research = ResearchExtraction.model_validate_json(response.message.content)
+            result_dict = final_research.model_dump()
+            result_dict['MRN'] = mrn
             result_dict['model_used'] = model_name
+            result_dict['extraction_success'] = True
             
-            # Check if any meaningful research data was actually extracted
-            research_fields_extracted = sum(1 for field in RESEARCH_FIELDS 
-                                           if field != 'MRN' and 
-                                           result_dict.get(field) is not None and 
-                                           result_dict.get(field) != '')
-            
-            # Only mark as successful if we extracted at least one research field
-            result_dict['extraction_success'] = research_fields_extracted > 0
-            result_dict['fields_extracted_count'] = research_fields_extracted
-            
-            if research_fields_extracted == 0:
-                print(f"  Warning: Valid JSON returned but no research fields extracted for MRN {mrn}")
+            # Count extracted fields
+            fields_extracted = sum(1 for field in RESEARCH_FIELDS 
+                                 if field != 'MRN' and 
+                                 result_dict.get(field) is not None and 
+                                 result_dict.get(field) != '')
+            result_dict['fields_extracted_count'] = fields_extracted
             
             return result_dict
                 
         except Exception as e:
-            print(f"Extraction failed for model {model_name}, MRN {mrn}: {e}")
-            
-            # Add more detailed debugging
-            if hasattr(e, 'response'):
-                print(f"  Response status: {getattr(e.response, 'status_code', 'Unknown')}")
-            
-            # Try to get the raw response if available
-            try:
-                if 'response' in locals():
-                    print(f"  Raw response content: {response.message.content[:200]}...")
-            except:
-                pass
-                
+            print(f"Combination failed for MRN {mrn}: {e}")
             return self._create_empty_result(mrn, model_name, success=False)
+
+
     
-    def _create_extraction_prompt(self, note_text: str, missing_fields: List[str] = None, day_info: str = "", accumulated_data: Dict[str, Any] = None) -> str:
-        """Create a structured prompt for medical information extraction"""
-        
-        # Field descriptions for research data
-        field_descriptions = {
-            'MRN': 'Medical Record Number - unique patient identifier',
-            'crs_y_n': 'Whether Cytokine Release Syndrome occured or not(Y/N); if a fever is present, then CRS is likely to be present even though not mentioned in the note',
-            'fever_onset_date': 'Date of fever onset (YYYY-MM-DD format)',
-            'last_fever_date': 'Date of last fever (YYYY-MM-DD format)',
-            'max_temp': 'Maximum temperature in Celsius',
-            'hypotension_y_n': 'Hypotension occured, requiring fluid bolus or vasopressors (Y/N)',
-            'pressor_use_num': 'If hypotension needing pressors, the number of vasopressors used',
-            'hypoxia_y_n': 'Hypoxia requiring supplemental oxygen (Y/N)',
-            'high_flow_o2_y_n': 'High flow oxygen requirement (Y/N)',
-            'bipap_or_intubation_y_n': 'BIPAP or intubation required (Y/N)',
-            'neurotox_y_n': 'Neurotoxicity occured (Y/N), any mention of altered mental status, confusion, or other neurological symptoms',
-            'toci_y_n': 'Tocilizumab administered (Y/N)',
-            'toci_start_date': 'Tocilizumab start date (YYYY-MM-DD format)',
-            'toci_stop_date': 'Tocilizumab stop date (YYYY-MM-DD format)',
-            'total_dose_toci': 'Total doses of tocilizumab administered, typically 1 or more doses'
-        }
-        
-        # Build accumulated data section if available
-        accumulated_info = ""
-        if accumulated_data:
-            accumulated_info = "CURRENT ACCUMULATED RESEARCH DATA (from previous days):\n"
-            for field in RESEARCH_FIELDS:
-                if field != 'MRN':
-                    value = accumulated_data.get(field)
-                    accumulated_info += f"- {field}: {value}\n"
-            accumulated_info += "\n"
-        
 
-        all_fields_desc = []
-        for field in RESEARCH_FIELDS:
-            if field in field_descriptions:
-                all_fields_desc.append(f"- {field}: {field_descriptions[field]}")
-            else:
-                all_fields_desc.append(f"- {field}")
-        
-        if "Discharge Summary" in day_info:
-             prompt = f"""
-{accumulated_info}DISCHARGE SUMMARY - FINAL UPDATE:
-{note_text}
-
-Based on the current accumulated data from all progress notes and this discharge summary, update any research fields necessary:
-{chr(10).join(all_fields_desc)}
-
-IMPORTANT INSTRUCTIONS:
-- Review the accumulated data from all previous progress notes AND this discharge summary
-- Discharge summaries often contain final outcomes, complications, and complete medication histories, especially neurotoxicity and tocilizumab information
-- Return the COMPLETE final research data based on all information
-"""
-        else:
-             prompt = f"""
-{accumulated_info}DAILY PROGRESS NOTE - {day_info}:
-{note_text}
-
-Based on the current accumulated data (if any) and this new daily note, update any research fields if necessary:
-{chr(10).join(all_fields_desc)}
-
-IMPORTANT INSTRUCTIONS:
-- Review the accumulated data from previous days AND this new daily note
-- Updates any fields if there is new information in the daily note
-- For temperatures: keep the highest temperature seen across all days
-- For Y/N fields: mark Y if the condition occurred at any point across all days
-- For counts/doses: accumulate totals across all days
-- For ongoing conditions: update with the latest status from today's note
-- Return the COMPLETE updated research data (not just changes from today)
-"""
-        
-        return prompt
     
     def _create_empty_result(self, mrn: str, model_name: str, success: bool = False) -> Dict[str, Any]:
         """Create empty result structure"""
@@ -258,6 +339,8 @@ IMPORTANT INSTRUCTIONS:
         result['extraction_success'] = success
         result['fields_extracted_count'] = 0
         return result
+    
+
 
 def load_progress_notes_data(file_path: str) -> pd.DataFrame:
     """Load the progress notes data"""
@@ -281,13 +364,12 @@ def load_dc_summary_data(file_path: str) -> pd.DataFrame:
         raise
 
 
-
 def select_encounters_to_process(notes_df: pd.DataFrame, 
-                                limit: Optional[int] = None,
-                                rows: Optional[List[int]] = None,
-                                row_range: Optional[List[int]] = None,
-                                mrns: Optional[List[str]] = None,
-                                random_sample: Optional[int] = None) -> pd.DataFrame:
+                          limit: Optional[int] = None,
+                          rows: Optional[List[int]] = None,
+                          row_range: Optional[List[int]] = None,
+                          mrns: Optional[List[str]] = None,
+                          random_sample: Optional[int] = None) -> pd.DataFrame:
     """Select specific encounters (MRN+BMT_date combinations) to process, then return all notes for selected encounters"""
     
     # First, get unique encounters (MRN+BMT_date combinations)
@@ -395,7 +477,7 @@ def group_notes_by_mrn_bmt_and_day(notes_df: pd.DataFrame) -> Dict[str, Dict]:
         
         if len(encounter_notes) == 0:
             continue
-            
+        
         # Sort by note_date to ensure chronological order
         encounter_notes = encounter_notes.sort_values('note_date')
         
@@ -484,19 +566,8 @@ def extract_research_info(notes_df: pd.DataFrame, models: List[str],
     if not extractor.check_ollama_connection():
         raise ConnectionError("Cannot connect to Ollama. Please ensure it's running.")
     
-    # Verify models are available
-    available_models = extractor.list_available_models()
-    print(f"Available models: {available_models}")
     
-    # Only use the models specified in the input list
     for model in models:
-        # Check if model exists (allow partial matching for versioned models)
-        model_exists = any(model in available_model for available_model in available_models)
-        if not model_exists:
-            print(f"Model {model} not found in Ollama. Available models: {available_models}")
-            print(f"Attempting to use model {model} anyway...")
-        
-        print(f"Starting extraction with model: {model}")
         
         # Process notes
         results = []
@@ -513,82 +584,120 @@ def extract_research_info(notes_df: pd.DataFrame, models: List[str],
             
             print(f"Processing encounter {encounter_key} (MRN {mrn}, BMT {bmt_date}) with {model} ({len(daily_notes_list)} days)")
             
-            # Initialize accumulated result for this encounter
-            accumulated_result = {
-                'MRN': mrn,
-                'bmt_date': bmt_date,
-                'encounter_key': encounter_key,
-                'model_used': model,
-                'extraction_success': False,
-                'fields_extracted_count': 0
-            }
+            # STEP 1: Extract daily findings for each day + DC summary
+            daily_findings_list = []
+            print(f"  STEP 1: Extracting daily findings...")
             
-            # Process each day's notes sequentially
+            # Process each daily progress note
             for day_idx, day_notes_df in enumerate(daily_notes_list):
-                day_date = str(day_notes_df.iloc[0]['note_date'])
+                note_date_offset = int(day_notes_df.iloc[0]['note_date'])
                 day_note_text = " ".join([str(note) for note in day_notes_df['note']])
-                day_info = f"Day {day_idx + 1} - {day_date}"
                 
-                print(f"  Day {day_idx + 1}: {day_date}")
+                # Calculate actual date: BMT date + note_date offset
+                bmt_date_dt = pd.to_datetime(bmt_date)
+                actual_date = bmt_date_dt + pd.Timedelta(days=note_date_offset)
+                actual_date_str = actual_date.strftime('%Y-%m-%d')
                 
-                # Extract research data from this day's notes, passing accumulated data
-                daily_extracted_data = extractor.extract_with_model(
+                day_info = f"Day {day_idx + 1} - {actual_date_str}"
+                
+                print(f"    Day {day_idx + 1}: Extracting findings from {actual_date_str} (BMT+{note_date_offset})")
+                
+                # Extract daily findings for this day only
+                daily_findings = extractor.extract_daily_findings(
                     model, 
                     day_note_text, 
-                    mrn, 
-                    day_info=day_info,
-                    accumulated_data=accumulated_result if day_idx > 0 else None
+                    actual_date_str,
+                    day_info
                 )
                 
-                # Update accumulated result with today's extraction
-                accumulated_result = daily_extracted_data
-                accumulated_result['day_processed'] = day_idx + 1
-                accumulated_result['total_days_processed'] = len(daily_notes_list)
+                daily_findings_list.append(daily_findings)
                 
-                print(f"    Updated: {accumulated_result.get('fields_extracted_count', 0)} total fields")
+                if daily_findings.get('extraction_success', False):
+                    print(f"      ✓ Extracted daily findings")
+                    # Print detailed findings for debugging
+                    print(f"      📋 Daily findings (day_date: {daily_findings.get('day_date', 'N/A')}):")
+                    for key, value in daily_findings.items():
+                        if key not in ['day_date', 'extraction_success', 'error'] and value is not None:
+                            print(f"        {key}: {value}")
+                else:
+                    print(f"      ✗ Failed to extract daily findings")
+                    if 'error' in daily_findings:
+                        print(f"        Error: {daily_findings['error']}")
                 
                 # Add small delay between days
                 time.sleep(0.3)
             
-            # FINAL STEP: Process DC summary if available to update all fields
+            # Process DC summary separately for neurotoxicity only
+            dc_neurotox_findings = None
             if dc_summary_df is not None:
-                # Use the bmt_date from the encounter data
                 dc_note_text = find_matching_dc_note(mrn, bmt_date, dc_summary_df)
-                
                 if dc_note_text:
-                    print(f"  Final step: Processing DC summary")
+                    print(f"    Discharge Summary: Extracting neurotoxicity for whole hospitalization")
                     
-                    # Extract research data from DC summary, updating ALL fields
-                    dc_extracted_data = extractor.extract_with_model(
+                    # Extract only neurotoxicity from DC summary for whole hospitalization
+                    dc_neurotox_findings = extractor.extract_dc_summary_neurotox(
                         model, 
-                        dc_note_text, 
-                        mrn, 
-                        day_info="Final - Discharge Summary",
-                        accumulated_data=accumulated_result
+                        dc_note_text
                     )
                     
-                    # Update with DC summary results
-                    accumulated_result = dc_extracted_data
-                    accumulated_result['dc_summary_processed'] = True
-                    accumulated_result['dc_note_length'] = len(dc_note_text)
-                    
-                    print(f"    Final update: {accumulated_result.get('fields_extracted_count', 0)} total fields")
+                    if dc_neurotox_findings.get('extraction_success', False):
+                        print(f"      ✓ Extracted DC neurotoxicity findings")
+                        # Print detailed DC findings for debugging
+                        print(f"      📋 DC neurotoxicity findings:")
+                        for key, value in dc_neurotox_findings.items():
+                            if key not in ['extraction_success', 'error'] and value is not None:
+                                print(f"        {key}: {value}")
                 else:
-                    print(f"  No matching DC summary found for encounter {encounter_key}")
-                    accumulated_result['dc_summary_processed'] = False
+                        print(f"      ✗ Failed to extract DC neurotoxicity findings")
+                        if 'error' in dc_neurotox_findings:
+                            print(f"        Error: {dc_neurotox_findings['error']}")
             else:
-                accumulated_result['dc_summary_processed'] = False
+                    print(f"    No DC summary found")
+            
+            # STEP 2: Simply combine all daily findings into final research fields
+            print(f"  STEP 2: Combining all findings into final research data...")
+            
+            final_result = extractor.combine_daily_findings(
+                model,
+                daily_findings_list,
+                mrn,
+                dc_neurotox_findings
+            )
+            
+            # Print final combined results for debugging
+            if final_result.get('extraction_success', False):
+                print(f"      ✓ Combined into final research fields")
+                print(f"      🎯 Final research data (ALL fields):")
+                for field in RESEARCH_FIELDS:
+                    if field != 'MRN':
+                        value = final_result.get(field)
+                        # Show ALL fields, including null values, for debugging
+                        print(f"        {field}: {value}")
+            else:
+                print(f"      ✗ Failed to combine findings")
+                if 'error' in final_result:
+                    print(f"        Error: {final_result['error']}")
+            
+            # Add metadata
+            final_result['bmt_date'] = bmt_date
+            final_result['encounter_key'] = encounter_key
+            final_result['total_days_processed'] = len(daily_notes_list)
+            final_result['daily_extractions_successful'] = sum(1 for df in daily_findings_list if df.get('extraction_success', False))
+            final_result['dc_summary_processed'] = dc_neurotox_findings is not None and dc_neurotox_findings.get('extraction_success', False)
+            final_result['dc_neurotox_extracted'] = dc_neurotox_findings.get('neurotox_hospitalization') if dc_neurotox_findings else None
+            final_result['total_findings_extracted'] = len(daily_findings_list)
             
             # Track final success/failure
-            if accumulated_result.get('extraction_success', False):
+            if final_result.get('extraction_success', False):
                 extraction_stats['success'] += 1
+                print(f"  ✓ SUCCESS: Extracted {final_result.get('fields_extracted_count', 0)} research fields")
             else:
                 extraction_stats['failed'] += 1
-                print(f"  FAILED: No research data extracted for encounter {encounter_key}")
+                print(f"  ✗ FAILED: No research data extracted for encounter {encounter_key}")
             
-            results.append(accumulated_result)
+            results.append(final_result)
             
-            # Add small delay between MRNs
+            # Add small delay between encounters
             time.sleep(0.5)
         
         # Save results for this model
@@ -605,28 +714,35 @@ def extract_research_info(notes_df: pd.DataFrame, models: List[str],
         print(f"  Successful extractions: {successful_extractions} ({successful_extractions/len(results_df)*100:.1f}%)")
         print(f"  Failed extractions: {failed_extractions} ({failed_extractions/len(results_df)*100:.1f}%)")
         
-        # Show daily processing statistics
+        # Show two-step processing statistics
         if 'total_days_processed' in results_df.columns:
             total_days = results_df['total_days_processed'].sum()
             avg_days = results_df['total_days_processed'].mean()
             print(f"  Total days processed: {total_days}")
-            print(f"  Average days per record: {avg_days:.1f}")
+            print(f"  Average days per encounter: {avg_days:.1f}")
             
             # Show range of days processed
             min_days = results_df['total_days_processed'].min()
             max_days = results_df['total_days_processed'].max()
-            print(f"  Days per record range: {min_days} to {max_days}")
+            print(f"  Days per encounter range: {min_days} to {max_days}")
+        
+        # Show Step 1 (daily extraction) success rates
+        if 'daily_extractions_successful' in results_df.columns and 'total_findings_extracted' in results_df.columns:
+            total_step1_success = results_df['daily_extractions_successful'].sum()
+            total_step1_attempted = results_df['total_findings_extracted'].sum()
+            step1_success_rate = total_step1_success / total_step1_attempted * 100 if total_step1_attempted > 0 else 0
+            print(f"  Step 1 (daily extraction) success rate: {total_step1_success}/{total_step1_attempted} ({step1_success_rate:.1f}%)")
         
         # Show DC summary processing statistics
         if 'dc_summary_processed' in results_df.columns:
             dc_processed = results_df['dc_summary_processed'].sum()
-            dc_available = len(results_df[results_df['dc_summary_processed'] == True])
-            print(f"  Records with DC summary processed: {dc_processed} ({dc_processed/len(results_df)*100:.1f}%)")
+            print(f"  Records with DC summary neurotoxicity processed: {dc_processed} ({dc_processed/len(results_df)*100:.1f}%)")
             
-            if dc_available > 0:
-                dc_rows = results_df[results_df['dc_summary_processed'] == True]
-                avg_dc_length = dc_rows['dc_note_length'].mean() if 'dc_note_length' in dc_rows.columns else 0
-                print(f"  Average DC summary length: {avg_dc_length:.0f} characters")
+            if 'dc_neurotox_extracted' in results_df.columns:
+                neurotox_y_count = (results_df['dc_neurotox_extracted'] == 'Y').sum()
+                neurotox_n_count = (results_df['dc_neurotox_extracted'] == 'N').sum()
+                if neurotox_y_count > 0 or neurotox_n_count > 0:
+                    print(f"  DC neurotoxicity findings: Y={neurotox_y_count}, N={neurotox_n_count}")
         
         # Show field extraction statistics for successful extractions
         if successful_extractions > 0:
@@ -683,7 +799,7 @@ def main():
             if args.dc_summary:
                 try:
                     dc_summary_df = load_dc_summary_data(args.dc_summary)
-                    print(f"DC summary will be used for final field updates")
+                    print(f"DC summary will be used for neurotoxicity extraction")
                 except Exception as e:
                     print(f"Warning: Failed to load DC summary data: {e}")
                     print("Proceeding with progress notes only")

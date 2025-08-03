@@ -5,7 +5,9 @@ from typing import Dict, List, Optional, Tuple
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, classification_report
 import argparse
 
-BASELINE_FIELDS = ['MRN', 'BMT_date', 'Disease_x', 'age', 'Gn', 'KPS', 'CMV', 'aborh', 'Tx_Type', 'HLA', 'donabo', 'doncmv', 'Source_x', 'Prep', 'AB', 'gvhdpr']
+RESEARCH_FIELDS = ['crs_y_n', 'fever_onset_date', 'last_fever_date', 'max_temp', 'hypotension_y_n',
+                   'pressor_use_num', 'hypoxia_y_n', 'high_flow_o2_y_n', 'bipap_or_intubation_y_n', 
+                   'neurotox_y_n', 'toci_y_n', 'toci_start_date', 'toci_stop_date', 'total_dose_toci']
 
 def compare_models_results(output_dir: str = "extracted_results") -> None:
     """Compare results from different models"""
@@ -16,7 +18,7 @@ def compare_models_results(output_dir: str = "extracted_results") -> None:
         return
     
     # Find all result files
-    result_files = list(output_path.glob("baseline_extraction_*.csv"))
+    result_files = list(output_path.glob("research_extraction_*.csv"))
     
     if not result_files:
         print("No extraction result files found")
@@ -28,7 +30,7 @@ def compare_models_results(output_dir: str = "extracted_results") -> None:
     comparison_data = []
     
     for file in result_files:
-        model_name = file.stem.replace("baseline_extraction_", "")
+        model_name = file.stem.replace("research_extraction_", "")
         df = pd.read_csv(file)
         
         # Calculate statistics
@@ -40,7 +42,7 @@ def compare_models_results(output_dir: str = "extracted_results") -> None:
         }
         
         # Count non-null extractions for each field
-        for field in BASELINE_FIELDS:
+        for field in RESEARCH_FIELDS:
             if field in df.columns:
                 non_null_count = df[field].notna().sum()
                 stats[f'{field}_extracted'] = non_null_count
@@ -50,14 +52,14 @@ def compare_models_results(output_dir: str = "extracted_results") -> None:
     
     # Save comparison report
     comparison_df = pd.DataFrame(comparison_data)
-    comparison_file = output_path / "model_comparison_report.csv"
+    comparison_file = output_path / "research_model_comparison_report.csv"
     comparison_df.to_csv(comparison_file, index=False)
     
     print(f"Model comparison report saved to: {comparison_file}")
     
     # Print summary
     print("\n" + "="*80)
-    print("MODEL COMPARISON SUMMARY")
+    print("RESEARCH MODEL COMPARISON SUMMARY")
     print("="*80)
     
     for _, row in comparison_df.iterrows():
@@ -88,28 +90,63 @@ def load_ground_truth(ground_truth_path: str) -> pd.DataFrame:
 def calculate_field_metrics(predicted: pd.Series, ground_truth: pd.Series, field_name: str) -> Dict[str, float]:
     """Calculate precision, recall, F1 for a specific field"""
     
-    # Define numeric fields that should be compared numerically
-    numeric_fields = ['age', 'KPS']
+    # Define field types
+    yn_fields = ['crs_y_n', 'hypotension_y_n', 'hypoxia_y_n', 'high_flow_o2_y_n', 'bipap_or_intubation_y_n', 'neurotox_y_n', 'toci_y_n']
+    numeric_fields = ['max_temp', 'pressor_use_num', 'total_dose_toci']
+    date_fields = ['fever_onset_date', 'last_fever_date', 'toci_start_date', 'toci_stop_date']
     
     if field_name in numeric_fields:
         # Handle numeric fields specially
         pred_numeric = pd.to_numeric(predicted, errors='coerce')
         truth_numeric = pd.to_numeric(ground_truth, errors='coerce')
         
-        # Calculate exact match accuracy for numeric fields
-        exact_matches = (pred_numeric == truth_numeric) | (
-            pred_numeric.isna() & truth_numeric.isna()
-        )
+        # Special handling for max_temp: if ground truth is NA, any prediction is acceptable
+        if field_name == 'max_temp':
+            # For max_temp: NA in ground truth means "not recorded because no CRS occurred"
+            # Any prediction (including extracting a temperature) should be considered correct
+            exact_matches = (
+                (pred_numeric == truth_numeric) |  # Exact match
+                (pred_numeric.isna() & truth_numeric.isna()) |  # Both NA
+                (truth_numeric.isna())  # Ground truth NA = any prediction is acceptable
+            )
+        else:
+            # Standard exact match logic for other numeric fields
+            exact_matches = (pred_numeric == truth_numeric) | (
+                pred_numeric.isna() & truth_numeric.isna()
+            )
+        
         exact_match_accuracy = exact_matches.mean()
         
         # For extraction metrics, consider non-NaN values as extracted
         pred_extracted = pred_numeric.notna()
-        truth_available = truth_numeric.notna()
+        
+        # Special handling for max_temp: ground truth is always "available" 
+        # because NA means "not recorded because no CRS" which is still valid ground truth
+        # This ensures that predictions are not penalized when truth is NA
+        if field_name == 'max_temp':
+            truth_available = pd.Series([True] * len(truth_numeric), index=truth_numeric.index)
+        else:
+            truth_available = truth_numeric.notna()
+        
+    elif field_name in date_fields:
+        # Handle date fields
+        pred_dates = pd.to_datetime(predicted, errors='coerce')
+        truth_dates = pd.to_datetime(ground_truth, errors='coerce')
+        
+        # Calculate exact match accuracy for dates
+        exact_matches = (pred_dates == truth_dates) | (
+            pred_dates.isna() & truth_dates.isna()
+        )
+        exact_match_accuracy = exact_matches.mean()
+        
+        # For extraction metrics, consider non-NaT values as extracted
+        pred_extracted = pred_dates.notna()
+        truth_available = truth_dates.notna()
         
     else:
-        # Handle text fields as before
-        pred_filled = predicted.fillna('').astype(str).str.strip().str.lower()
-        truth_filled = ground_truth.fillna('').astype(str).str.strip().str.lower()
+        # Handle Y/N fields and other text fields
+        pred_filled = predicted.fillna('').astype(str).str.strip().str.upper()
+        truth_filled = ground_truth.fillna('').astype(str).str.strip().str.upper()
         
         # Calculate exact match accuracy
         exact_matches = (pred_filled == truth_filled)
@@ -142,36 +179,96 @@ def calculate_field_metrics(predicted: pd.Series, ground_truth: pd.Series, field
     # Coverage (how often we extracted when truth was available)
     coverage = (pred_extracted & truth_available).sum() / truth_available.sum() if truth_available.sum() > 0 else 0.0
     
-    # Add additional metrics for numeric fields
+    # Add additional metrics for specific field types
     additional_metrics = {}
+    
     if field_name in numeric_fields:
         # Calculate tolerance-based accuracy for numeric fields
-        if field_name == 'age':
-            tolerance = 1  # Within 1 year
-        elif field_name == 'KPS':
-            tolerance = 10  # Within 10 points
-        else:
-            tolerance = 0
+        tolerance = 0
+        if field_name == 'max_temp':
+            tolerance = 1.0  # Within 1 degree
+        elif field_name == 'pressor_use_num':
+            tolerance = 0  # Exact match required
+        elif field_name == 'total_dose_toci':
+            tolerance = 0.5  # Within 0.5 dose
         
         if tolerance > 0:
             pred_numeric = pd.to_numeric(predicted, errors='coerce')
             truth_numeric = pd.to_numeric(ground_truth, errors='coerce')
             
             # Calculate tolerance-based matches
-            tolerance_matches = (
-                (abs(pred_numeric - truth_numeric) <= tolerance) | 
-                (pred_numeric.isna() & truth_numeric.isna())
-            )
+            if field_name == 'max_temp':
+                # For max_temp: if ground truth is NA (no CRS), any prediction is acceptable
+                tolerance_matches = (
+                    (abs(pred_numeric - truth_numeric) <= tolerance) | 
+                    (pred_numeric.isna() & truth_numeric.isna()) |
+                    (truth_numeric.isna())  # Ground truth NA = any prediction is acceptable
+                )
+            else:
+                # Standard tolerance logic for other numeric fields
+                tolerance_matches = (
+                    (abs(pred_numeric - truth_numeric) <= tolerance) | 
+                    (pred_numeric.isna() & truth_numeric.isna())
+                )
+            
             tolerance_accuracy = tolerance_matches.mean()
             additional_metrics[f'tolerance_accuracy_{tolerance}'] = tolerance_accuracy
             
-            # Calculate mean absolute error for extracted values
-            both_available = pred_numeric.notna() & truth_numeric.notna()
-            if both_available.any():
-                mae = abs(pred_numeric[both_available] - truth_numeric[both_available]).mean()
-                additional_metrics['mean_absolute_error'] = mae
+        # Calculate mean absolute error for extracted values
+        pred_numeric = pd.to_numeric(predicted, errors='coerce')
+        truth_numeric = pd.to_numeric(ground_truth, errors='coerce')
+        both_available = pred_numeric.notna() & truth_numeric.notna()
+        if both_available.any():
+            mae = abs(pred_numeric[both_available] - truth_numeric[both_available]).mean()
+            additional_metrics['mean_absolute_error'] = mae
+        else:
+            additional_metrics['mean_absolute_error'] = None
+    
+    elif field_name in date_fields:
+        # Calculate day-level tolerance for dates
+        pred_dates = pd.to_datetime(predicted, errors='coerce')
+        truth_dates = pd.to_datetime(ground_truth, errors='coerce')
+        
+        both_available = pred_dates.notna() & truth_dates.notna()
+        if both_available.any():
+            # Calculate day differences
+            day_diffs = abs((pred_dates[both_available] - truth_dates[both_available]).dt.days)
+            
+            # Tolerance-based accuracy (within 1 day)
+            day_tolerance_matches = (day_diffs <= 1) | (pred_dates.isna() & truth_dates.isna())
+            day_tolerance_accuracy = day_tolerance_matches.sum() / len(predicted)
+            additional_metrics['day_tolerance_accuracy_1'] = day_tolerance_accuracy
+            
+            # Mean absolute error in days
+            mae_days = day_diffs.mean()
+            additional_metrics['mean_absolute_error_days'] = mae_days
+        else:
+            additional_metrics['day_tolerance_accuracy_1'] = exact_match_accuracy
+            additional_metrics['mean_absolute_error_days'] = None
+    
+    elif field_name in yn_fields:
+        # For Y/N fields, calculate agreement on positive cases
+        pred_yn = predicted.fillna('').astype(str).str.strip().str.upper()
+        truth_yn = ground_truth.fillna('').astype(str).str.strip().str.upper()
+        
+        # Calculate sensitivity and specificity for Y/N classification
+        both_available = (pred_yn.isin(['Y', 'N'])) & (truth_yn.isin(['Y', 'N']))
+        
+        if both_available.any():
+            pred_binary = (pred_yn[both_available] == 'Y').astype(int)
+            truth_binary = (truth_yn[both_available] == 'Y').astype(int)
+            
+            if len(np.unique(truth_binary)) > 1:  # If there's variation in ground truth
+                sensitivity = recall_score(truth_binary, pred_binary, zero_division=0.0)
+                specificity_tn = ((pred_binary == 0) & (truth_binary == 0)).sum()
+                specificity_fp = ((pred_binary == 1) & (truth_binary == 0)).sum()
+                specificity = specificity_tn / (specificity_tn + specificity_fp) if (specificity_tn + specificity_fp) > 0 else 0.0
+                
+                additional_metrics['sensitivity'] = sensitivity
+                additional_metrics['specificity'] = specificity
             else:
-                additional_metrics['mean_absolute_error'] = None
+                additional_metrics['sensitivity'] = exact_match_accuracy
+                additional_metrics['specificity'] = exact_match_accuracy
 
     result = {
         'field': field_name,
@@ -210,13 +307,18 @@ def evaluate_model_against_ground_truth(predictions_file: str, ground_truth_file
     predictions['MRN'] = predictions['MRN'].astype(str)
     ground_truth['MRN'] = ground_truth['MRN'].astype(str)
     
-    # Determine merge columns - prioritize MRN-based matching
+    # Determine merge columns - prioritize MRN + BMT_date matching
     merge_columns = ['MRN']
-    if 'admit_date' in predictions.columns and 'admit_date' in ground_truth.columns:
+    if 'bmt_date' in predictions.columns and 'BMT_date' in ground_truth.columns:
+        # Standardize BMT_date column names
+        ground_truth = ground_truth.rename(columns={'BMT_date': 'bmt_date'})
+        merge_columns.append('bmt_date')
+        print(f"Merging on: {merge_columns}")
+    elif 'admit_date' in predictions.columns and 'admit_date' in ground_truth.columns:
         merge_columns.append('admit_date')
         print(f"Merging on: {merge_columns}")
     else:
-        print(f"Merging on: MRN only (admit_date not available in both files)")
+        print(f"Merging on: MRN only (date columns not available in both files)")
     
     # Check overlap before merging
     pred_mrns = set(predictions['MRN'].unique())
@@ -248,10 +350,7 @@ def evaluate_model_against_ground_truth(predictions_file: str, ground_truth_file
     # Calculate metrics for each field
     field_metrics = []
     
-    for field in BASELINE_FIELDS:
-        if field == 'MRN':  # Skip MRN as it's used for matching
-            continue
-            
+    for field in RESEARCH_FIELDS:
         pred_col = f"{field}_pred"
         truth_col = f"{field}_truth"
         
@@ -315,10 +414,10 @@ def check_data_alignment(predictions_dir: str, ground_truth_file: str) -> None:
     
     # Check each prediction file
     predictions_path = Path(predictions_dir)
-    prediction_files = list(predictions_path.glob("baseline_extraction_*.csv"))
+    prediction_files = list(predictions_path.glob("research_extraction_*.csv"))
     
     for pred_file in prediction_files:
-        model_name = pred_file.stem.replace("baseline_extraction_", "")
+        model_name = pred_file.stem.replace("research_extraction_", "")
         predictions = pd.read_csv(pred_file)
         pred_mrns = set(predictions['MRN'].astype(str))
         
@@ -353,7 +452,7 @@ def evaluate_all_models(predictions_dir: str, ground_truth_file: str, output_dir
         return
     
     # Find all prediction files
-    prediction_files = list(predictions_path.glob("baseline_extraction_*.csv"))
+    prediction_files = list(predictions_path.glob("research_extraction_*.csv"))
     
     if not prediction_files:
         print("No prediction files found")
@@ -365,14 +464,14 @@ def evaluate_all_models(predictions_dir: str, ground_truth_file: str, output_dir
     check_data_alignment(predictions_dir, ground_truth_file)
     
     print("\n" + "="*80)
-    print("MODEL EVALUATION")
+    print("RESEARCH MODEL EVALUATION")
     print("="*80)
     
     all_results = []
     detailed_results = {}
     
     for pred_file in prediction_files:
-        model_name = pred_file.stem.replace("baseline_extraction_", "")
+        model_name = pred_file.stem.replace("research_extraction_", "")
         
         try:
             # Calculate field-level metrics
@@ -393,17 +492,21 @@ def evaluate_all_models(predictions_dir: str, ground_truth_file: str, output_dir
                 print(f"  Macro Accuracy: {overall_metrics['macro_accuracy']:.3f}")
                 print(f"  Coverage: {overall_metrics['overall_coverage']:.3f}")
                 
-                # Show tolerance accuracy for numeric fields if available
-                numeric_tolerance_info = []
+                # Show tolerance accuracy for numeric/date fields if available
+                tolerance_info = []
                 for _, row in field_metrics.iterrows():
-                    if row['field'] in ['age', 'KPS']:
+                    field = row['field']
+                    if field in ['max_temp', 'total_dose_toci']:
                         for col in row.index:
                             if col.startswith('tolerance_accuracy_'):
                                 tolerance_val = col.split('_')[-1]
-                                numeric_tolerance_info.append(f"{row['field']} (±{tolerance_val}): {row[col]:.3f}")
+                                tolerance_info.append(f"{field} (±{tolerance_val}): {row[col]:.3f}")
+                    elif field in ['fever_onset_date', 'last_fever_date', 'toci_start_date', 'toci_stop_date']:
+                        if 'day_tolerance_accuracy_1' in row.index:
+                            tolerance_info.append(f"{field} (±1 day): {row['day_tolerance_accuracy_1']:.3f}")
                 
-                if numeric_tolerance_info:
-                    print(f"  Tolerance Accuracy: {', '.join(numeric_tolerance_info)}")
+                if tolerance_info:
+                    print(f"  Tolerance Accuracy: {', '.join(tolerance_info)}")
         
         except Exception as e:
             print(f"Error evaluating {model_name}: {e}")
@@ -418,18 +521,18 @@ def evaluate_all_models(predictions_dir: str, ground_truth_file: str, output_dir
     
     # Save overall comparison
     overall_df = pd.DataFrame(all_results)
-    overall_file = output_path / "evaluation_overall_metrics.csv"
+    overall_file = output_path / "research_evaluation_overall_metrics.csv"
     overall_df.to_csv(overall_file, index=False)
     print(f"\nOverall metrics saved to: {overall_file}")
     
     # Save detailed field-level results
     for model_name, field_metrics in detailed_results.items():
-        detailed_file = output_path / f"evaluation_detailed_{model_name}.csv"
+        detailed_file = output_path / f"research_evaluation_detailed_{model_name}.csv"
         field_metrics.to_csv(detailed_file, index=False)
     
     # Print comparison summary
     print("\n" + "="*80)
-    print("MODEL EVALUATION SUMMARY")
+    print("RESEARCH MODEL EVALUATION SUMMARY")
     print("="*80)
     
     # Sort by macro F1 score
@@ -444,7 +547,7 @@ def analyze_field_performance(predictions_dir: str, ground_truth_file: str) -> N
     """Analyze performance by field across all models"""
     
     predictions_path = Path(predictions_dir)
-    prediction_files = list(predictions_path.glob("baseline_extraction_*.csv"))
+    prediction_files = list(predictions_path.glob("research_extraction_*.csv"))
     
     if not prediction_files:
         print("No prediction files found")
@@ -453,7 +556,7 @@ def analyze_field_performance(predictions_dir: str, ground_truth_file: str) -> N
     field_performance = {}
     
     for pred_file in prediction_files:
-        model_name = pred_file.stem.replace("baseline_extraction_", "")
+        model_name = pred_file.stem.replace("research_extraction_", "")
         
         try:
             field_metrics = evaluate_model_against_ground_truth(str(pred_file), ground_truth_file)
@@ -471,13 +574,23 @@ def analyze_field_performance(predictions_dir: str, ground_truth_file: str) -> N
                     'accuracy': row['exact_match_accuracy']
                 }
                 
-                # Add tolerance accuracy for numeric fields
-                if field in ['age', 'KPS']:
+                # Add field-specific metrics
+                if field in ['max_temp', 'pressor_use_num', 'total_dose_toci']:
                     for col in row.index:
                         if col.startswith('tolerance_accuracy_'):
                             perf_data[col] = row[col]
                         elif col == 'mean_absolute_error':
                             perf_data[col] = row[col]
+                elif field in ['fever_onset_date', 'last_fever_date', 'toci_start_date', 'toci_stop_date']:
+                    if 'day_tolerance_accuracy_1' in row.index:
+                        perf_data['day_tolerance_accuracy_1'] = row['day_tolerance_accuracy_1']
+                    if 'mean_absolute_error_days' in row.index:
+                        perf_data['mean_absolute_error_days'] = row['mean_absolute_error_days']
+                elif field in ['crs_y_n', 'hypotension_y_n', 'hypoxia_y_n', 'high_flow_o2_y_n', 'bipap_or_intubation_y_n', 'neurotox_y_n', 'toci_y_n']:
+                    if 'sensitivity' in row.index:
+                        perf_data['sensitivity'] = row['sensitivity']
+                    if 'specificity' in row.index:
+                        perf_data['specificity'] = row['specificity']
                 
                 field_performance[field].append(perf_data)
         
@@ -486,7 +599,7 @@ def analyze_field_performance(predictions_dir: str, ground_truth_file: str) -> N
     
     # Print field analysis
     print("\n" + "="*80)
-    print("FIELD PERFORMANCE ANALYSIS")
+    print("RESEARCH FIELD PERFORMANCE ANALYSIS")
     print("="*80)
     
     for field, performances in field_performance.items():
@@ -503,8 +616,8 @@ def analyze_field_performance(predictions_dir: str, ground_truth_file: str) -> N
         
         print(f"  Average across models: F1={avg_f1:.3f}, P={avg_precision:.3f}, R={avg_recall:.3f}, Acc={avg_accuracy:.3f}")
         
-        # For numeric fields, also show tolerance accuracy
-        if field in ['age', 'KPS']:
+        # Show field-specific metrics
+        if field in ['max_temp', 'pressor_use_num', 'total_dose_toci']:
             tolerance_key = None
             mae_values = []
             for p in performances:
@@ -522,7 +635,32 @@ def analyze_field_performance(predictions_dir: str, ground_truth_file: str) -> N
             
             if mae_values:
                 avg_mae = np.mean(mae_values)
-                print(f"  Average MAE: {avg_mae:.2f}")
+                unit = "°F" if field == 'max_temp' else "doses" if field == 'total_dose_toci' else "units"
+                print(f"  Average MAE: {avg_mae:.2f} {unit}")
+        
+        elif field in ['fever_onset_date', 'last_fever_date', 'toci_start_date', 'toci_stop_date']:
+            day_tolerance_values = [p.get('day_tolerance_accuracy_1', 0) for p in performances if 'day_tolerance_accuracy_1' in p]
+            mae_day_values = [p['mean_absolute_error_days'] for p in performances if 'mean_absolute_error_days' in p and p['mean_absolute_error_days'] is not None]
+            
+            if day_tolerance_values:
+                avg_day_tolerance = np.mean(day_tolerance_values)
+                print(f"  Average day tolerance accuracy (±1 day): {avg_day_tolerance:.3f}")
+            
+            if mae_day_values:
+                avg_mae_days = np.mean(mae_day_values)
+                print(f"  Average MAE: {avg_mae_days:.2f} days")
+        
+        elif field in ['crs_y_n', 'hypotension_y_n', 'hypoxia_y_n', 'high_flow_o2_y_n', 'bipap_or_intubation_y_n', 'neurotox_y_n', 'toci_y_n']:
+            sens_values = [p.get('sensitivity', 0) for p in performances if 'sensitivity' in p]
+            spec_values = [p.get('specificity', 0) for p in performances if 'specificity' in p]
+            
+            if sens_values:
+                avg_sensitivity = np.mean(sens_values)
+                print(f"  Average sensitivity: {avg_sensitivity:.3f}")
+            
+            if spec_values:
+                avg_specificity = np.mean(spec_values)
+                print(f"  Average specificity: {avg_specificity:.3f}")
         
         # Find best model for this field
         best_model = max(performances, key=lambda x: x['f1_score'])
@@ -533,21 +671,31 @@ def analyze_field_performance(predictions_dir: str, ground_truth_file: str) -> N
         for perf in performances_sorted:
             base_info = f"    {perf['model']:<15}: F1={perf['f1_score']:.3f}, P={perf['precision']:.3f}, R={perf['recall']:.3f}"
             
-            # Add tolerance accuracy for numeric fields
-            if field in ['age', 'KPS']:
+            # Add field-specific metrics
+            if field in ['max_temp', 'pressor_use_num', 'total_dose_toci']:
                 for key in perf.keys():
                     if key.startswith('tolerance_accuracy_'):
                         base_info += f", Tol={perf[key]:.3f}"
                         break
                 if 'mean_absolute_error' in perf and perf['mean_absolute_error'] is not None:
                     base_info += f", MAE={perf['mean_absolute_error']:.2f}"
+            elif field in ['fever_onset_date', 'last_fever_date', 'toci_start_date', 'toci_stop_date']:
+                if 'day_tolerance_accuracy_1' in perf:
+                    base_info += f", Day_Tol={perf['day_tolerance_accuracy_1']:.3f}"
+                if 'mean_absolute_error_days' in perf and perf['mean_absolute_error_days'] is not None:
+                    base_info += f", MAE_days={perf['mean_absolute_error_days']:.2f}"
+            elif field in ['crs_y_n', 'hypotension_y_n', 'hypoxia_y_n', 'high_flow_o2_y_n', 'bipap_or_intubation_y_n', 'neurotox_y_n', 'toci_y_n']:
+                if 'sensitivity' in perf:
+                    base_info += f", Sens={perf['sensitivity']:.3f}"
+                if 'specificity' in perf:
+                    base_info += f", Spec={perf['specificity']:.3f}"
             
             print(base_info)
 
 
 def main():
     """Main evaluation function"""
-    parser = argparse.ArgumentParser(description="Evaluate medical information extraction results")
+    parser = argparse.ArgumentParser(description="Evaluate research information extraction results")
     
     parser.add_argument("--predictions-dir", "-p", required=True,
                        help="Directory containing prediction CSV files")
