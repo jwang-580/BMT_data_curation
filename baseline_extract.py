@@ -432,7 +432,7 @@ def extract_baseline_info(notes_df: pd.DataFrame, models: List[str],
     
     # Create output directory
     output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
+    output_path.mkdir(parents=True, exist_ok=True)
     
     # Select rows to process based on various criteria
     notes_to_process = select_rows_to_process(
@@ -538,7 +538,9 @@ def extract_baseline_info(notes_df: pd.DataFrame, models: List[str],
         
         # Save results for this model
         results_df = pd.DataFrame(results)
-        output_file = output_path / f"baseline_extraction_{model.replace(':', '_')}.csv"
+        output_file = Path(output_dir) / f"baseline_extraction_{model.replace(':', '_')}.csv"
+        # Ensure the output directory for the CSV file exists
+        output_file.parent.mkdir(parents=True, exist_ok=True)
         results_df.to_csv(output_file, index=False)
         
         # Print detailed summary

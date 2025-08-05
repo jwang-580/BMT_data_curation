@@ -703,6 +703,7 @@ def extract_research_info(notes_df: pd.DataFrame, models: List[str],
         # Save results for this model
         results_df = pd.DataFrame(results)
         output_file = output_path / f"research_extraction_{model.replace(':', '_')}.csv"
+        output_file.parent.mkdir(parents=True, exist_ok=True)
         results_df.to_csv(output_file, index=False)
         
         # Print detailed summary

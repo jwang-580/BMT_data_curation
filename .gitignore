@@ -1,3 +1,4 @@
-*.csv
+/data
+/results/extracted_results
 *.xlsx
 /models 
